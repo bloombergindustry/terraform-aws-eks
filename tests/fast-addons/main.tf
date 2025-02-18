@@ -2,10 +2,24 @@ provider "aws" {
   region = local.region
 }
 
+provider "kubectl" {
+  apply_retry_count      = 5
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  load_config_file       = false
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    # This requires the awscli to be installed locally where Terraform is executed
+    args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+  }
+}
+
 locals {
-  name            = "ex-${basename(path.cwd)}"
+  name            = "vc-${basename(path.cwd)}"
   cluster_version = "1.31"
-  region          = "eu-west-1"
+  region          = "us-east-1"
 
   tags = {
     Test       = local.name
@@ -47,12 +61,8 @@ module "eks" {
       before_compute = true
       configuration_values = jsonencode({
         env = {
-          # Use subnet tags to avoid the need to inject the ENIConfig
-          # which requires a live API server endpoint which leads to a dependency of:
-          # Control plane -> API request to create ENIConfig -> VPC CNI addon -> nodes/compute
-          # With the subnet discovery feature, we can avoid this dependency:
-          # Control plane -> VPC CNI addon -> nodes/compute
-          ENABLE_SUBNET_DISCOVERY = "true"
+          AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG = "true"
+          ENI_CONFIG_LABEL_DEF               = "topology.kubernetes.io/zone"
         }
       })
     }
@@ -72,6 +82,25 @@ module "eks" {
   }
 
   tags = local.tags
+}
+
+resource "kubectl_manifest" "eni_config" {
+  count = length(aws_subnet.custom_network)
+
+  yaml_body = yamlencode({
+    apiVersion = "crd.k8s.amazonaws.com/v1alpha1"
+    kind       = "ENIConfig"
+    metadata = {
+      name = aws_subnet.custom_network[count.index].availability_zone
+    }
+    spec = {
+      securityGroups = [
+        module.eks.cluster_primary_security_group_id,
+        module.eks.node_security_group_id,
+      ]
+      subnet = aws_subnet.custom_network[count.index].id
+    }
+  })
 }
 
 ################################################################################
